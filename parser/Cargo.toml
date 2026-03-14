@@ -1,0 +1,24 @@
+[package]
+name = "luac-parser"
+version = "0.5.2"
+edition = "2021"
+documentation = "https://docs.rs/luac-parser"
+license = "MIT"
+include = ["/src", "README.md"]
+keywords = ['lua', 'bytecode', 'parser', 'luajit', 'luau']
+description = "lua bytecode parser"
+repository = "https://github.com/metaworm/luac-parser-rs"
+
+[features]
+default = ['rmp-serde']
+
+[dependencies]
+log = "0.4"
+nom = "7"
+nom-supreme = '0.8'
+nom-leb128 = '0.2'
+bitflags = '2'
+rmp-serde = {version = '1', optional = true}
+serde_bytes = '0.11'
+serde = {version = '1', features = ['derive', 'rc']}
+bincode = {version = '2.0.0-rc', features = ['serde']}

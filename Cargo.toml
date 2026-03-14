@@ -1,0 +1,3 @@
+[workspace]
+members = ["parser", "luadec", "luadec-cli"]
+resolver = "3"
