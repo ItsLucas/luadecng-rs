@@ -41,11 +41,11 @@ cat input.luac | luadec -
 
 ### As a Library
 
-Add `luadec` to your `Cargo.toml`:
+Add `luadec-rust` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-luadec = { path = "luadec" }
+luadec-rust = "1"
 ```
 
 Simple usage:
@@ -77,9 +77,8 @@ let source = emit::emit_chunk(&func);
 
 | Crate | Description |
 |-------|-------------|
-| `luadec` | Core decompiler library. Exposes `luadec::decompile()` and the `lua51` module for fine-grained access. |
+| `luadec-rust` | Core decompiler library. Exposes `luadec::decompile()` and the `lua51` module for fine-grained access. |
 | `luadec-cli` | Command-line interface. Thin wrapper around the library. |
-| `parser` | Lua bytecode parser (vendored from [luac-parser-rs](https://github.com/metaworm/luac-parser-rs)). |
 
 ### Internal Modules (`luadec::lua51`)
 
@@ -96,7 +95,7 @@ let source = emit::emit_chunk(&func);
 
 ## Acknowledgments
 
-The bytecode parser (`parser/` directory) is based on [luac-parser-rs](https://github.com/metaworm/luac-parser-rs) by [metaworm](https://github.com/metaworm), licensed under MIT. It supports Lua 5.1–5.4, LuaJIT, and Luau bytecode formats. Thank you for the excellent work on Lua bytecode parsing.
+The bytecode parser uses [luac-parser-rs](https://github.com/metaworm/luac-parser-rs) by [metaworm](https://github.com/metaworm). Thank you for the excellent work on Lua bytecode parsing.
 
 ## License
 
