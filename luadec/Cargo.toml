@@ -1,13 +1,13 @@
 [package]
 name = "luadec-rust"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 description = "A Lua 5.1 bytecode decompiler written in Rust"
 license = "MIT"
 authors = ["ItsLucas <itslucas@itslucas.me>"]
 repository = "https://github.com/ItsLucas/luadecng-rs"
 readme = "../README.md"
-documentation = "https://docs.rs/luadec"
+documentation = "https://docs.rs/luadec-rust/"
 keywords = ["lua", "decompiler", "bytecode", "reverse-engineering", "lua51"]
 categories = ["parsing", "development-tools", "games"]
 
