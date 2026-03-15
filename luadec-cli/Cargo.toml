@@ -1,11 +1,12 @@
 [package]
 name = "luadec-cli"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+publish = false
 
 [[bin]]
 name = "luadec"
 path = "src/main.rs"
 
 [dependencies]
-luadec = { path = "../luadec" }
+luadec = { package = "luadec-rust", path = "../luadec" }

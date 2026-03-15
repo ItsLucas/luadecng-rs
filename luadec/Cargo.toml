@@ -1,8 +1,12 @@
 [package]
-name = "luadec"
-version = "0.1.0"
+name = "luadec-rust"
+version = "1.0.0"
 edition = "2024"
+description = "A Lua 5.1 bytecode decompiler written in Rust"
+license = "MIT"
+repository = "https://github.com/ItsLucas/luadecng-rs"
+readme = "../README.md"
 
 [dependencies]
 encoding_rs = "0.8"
-luac-parser = { path = "../parser" }
+luac-parser = "0.5.2"
