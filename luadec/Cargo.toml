@@ -1,12 +1,22 @@
 [package]
 name = "luadec-rust"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "A Lua 5.1 bytecode decompiler written in Rust"
 license = "MIT"
+authors = ["ItsLucas <itslucas@itslucas.me>"]
 repository = "https://github.com/ItsLucas/luadecng-rs"
 readme = "../README.md"
+documentation = "https://docs.rs/luadec"
+keywords = ["lua", "decompiler", "bytecode", "reverse-engineering", "lua51"]
+categories = ["parsing", "development-tools", "games"]
 
 [dependencies]
 encoding_rs = "0.8"
 luac-parser = "0.5.2"
+
+[package.metadata.docs.rs]
+# Build docs with all features on docs.rs
+all-features = true
+# Use a specific target for consistent docs
+targets = ["x86_64-unknown-linux-gnu"]
