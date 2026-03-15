@@ -52,7 +52,7 @@ Simple usage:
 
 ```rust
 let bytecode = std::fs::read("input.luac").unwrap();
-let source = luadec::decompile(&bytecode).unwrap();
+let source = luadec_rust::decompile(&bytecode).unwrap();
 println!("{}", source);
 ```
 
@@ -60,8 +60,8 @@ For more control over the decompilation pipeline:
 
 ```rust
 use luac_parser::lua_bytecode;
-use luadec::lua51::lifter::Lifter;
-use luadec::lua51::emit;
+use luadec_rust::lua51::lifter::Lifter;
+use luadec_rust::lua51::emit;
 
 let data = std::fs::read("input.luac").unwrap();
 let (_, bytecode) = lua_bytecode(&data).unwrap();
@@ -77,10 +77,10 @@ let source = emit::emit_chunk(&func);
 
 | Crate | Description |
 |-------|-------------|
-| `luadec-rust` | Core decompiler library. Exposes `luadec::decompile()` and the `lua51` module for fine-grained access. |
+| `luadec-rust` | Core decompiler library. Exposes `luadec_rust::decompile()` and the `lua51` module for fine-grained access. |
 | `luadec-cli` | Command-line interface. Thin wrapper around the library. |
 
-### Internal Modules (`luadec::lua51`)
+### Internal Modules (`luadec_rust::lua51`)
 
 | Module | Purpose |
 |--------|---------|

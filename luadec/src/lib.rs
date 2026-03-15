@@ -1,4 +1,4 @@
-//! # luadec
+//! # luadec-rust
 //!
 //! A Lua 5.1 bytecode decompiler library.
 //!
@@ -8,7 +8,7 @@
 //!
 //! ```no_run
 //! let bytecode = std::fs::read("input.luac").unwrap();
-//! let source = luadec::decompile(&bytecode).unwrap();
+//! let source = luadec_rust::decompile(&bytecode).unwrap();
 //! println!("{}", source);
 //! ```
 //!
@@ -18,8 +18,8 @@
 //!
 //! ```no_run
 //! use luac_parser::lua_bytecode;
-//! use luadec::lua51::lifter::Lifter;
-//! use luadec::lua51::emit;
+//! use luadec_rust::lua51::lifter::Lifter;
+//! use luadec_rust::lua51::emit;
 //!
 //! let data = std::fs::read("input.luac").unwrap();
 //! let (_, bytecode) = lua_bytecode(&data).unwrap();
@@ -42,7 +42,7 @@ pub mod lua51;
 ///
 /// ```no_run
 /// let bytecode = std::fs::read("compiled.luac").unwrap();
-/// let source = luadec::decompile(&bytecode).unwrap();
+/// let source = luadec_rust::decompile(&bytecode).unwrap();
 /// println!("{}", source);
 /// ```
 pub fn decompile(bytecode: &[u8]) -> Result<String, String> {

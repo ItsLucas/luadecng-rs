@@ -27,7 +27,7 @@ fn main() {
         })
     };
 
-    let source = match luadec::decompile(&data) {
+    let source = match luadec_rust::decompile(&data) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: {}", e);
