@@ -246,14 +246,17 @@ fn classify_loop(cfg: &ControlFlowGraph, edge_kind: EdgeKind, header: usize) -> 
         EdgeKind::ForLoopBack => LoopKind::NumericFor,
         EdgeKind::TForLoopBack => LoopKind::GenericFor,
         _ => {
-            // Check if header block ends with FORLOOP
+            // Check if header block contains FORLOOP or TFORLOOP
             let block = &cfg.blocks[header];
-            let last_inst = &cfg.instructions[block.end];
             use crate::lua51::opcodes::OpCode;
-            match last_inst.op {
-                OpCode::ForLoop => LoopKind::NumericFor,
-                _ => LoopKind::WhileRepeat,
+            for pc in block.start..=block.end {
+                match cfg.instructions[pc].op {
+                    OpCode::ForLoop => return LoopKind::NumericFor,
+                    OpCode::TForLoop => return LoopKind::GenericFor,
+                    _ => {}
+                }
             }
+            LoopKind::WhileRepeat
         }
     }
 }

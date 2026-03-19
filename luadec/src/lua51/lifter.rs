@@ -13,13 +13,17 @@ use crate::lua51::opcodes::OpCode;
 pub struct Lifter<'a> {
     chunk: &'a LuaChunk,
     cfg: ControlFlowGraph,
-    dom: DominatorTree,
+    _dom: DominatorTree,
     loops: Vec<NaturalLoop>,
     liveness: LivenessInfo,
     /// Register expressions: tracks what expression is currently held in each register.
     regs: Vec<Option<Expr>>,
     /// Pending tables being constructed (register -> accumulated fields).
     pending_tables: HashMap<u32, Vec<TableField>>,
+    /// Stable references a register value has been assigned into.
+    capture_aliases: HashMap<u32, Expr>,
+    /// Registers that are updated from their own previous value across branches.
+    accumulator_regs: HashSet<u32>,
     /// Blocks already visited to prevent infinite recursion.
     visited_blocks: HashSet<usize>,
     /// Local variable names assigned to registers (reg -> name).
@@ -30,12 +34,21 @@ pub struct Lifter<'a> {
     num_params: u32,
     /// Whether this chunk has debug info (locals/upvalue names).
     has_debug_info: bool,
+    /// Upvalue expressions resolved from the parent closure site.
+    resolved_upvalues: Vec<Option<Expr>>,
     /// Loop exit block IDs for break detection.
     loop_exits: HashSet<usize>,
 }
 
 impl<'a> Lifter<'a> {
     pub fn decompile(chunk: &'a LuaChunk) -> Function {
+        Self::decompile_with_upvalues(chunk, Vec::new())
+    }
+
+    fn decompile_with_upvalues(
+        chunk: &'a LuaChunk,
+        resolved_upvalues: Vec<Option<Expr>>,
+    ) -> Function {
         let cfg = ControlFlowGraph::build(&chunk.instructions);
         let dom = DominatorTree::build(&cfg);
         let loops = find_loops(&cfg, &dom);
@@ -55,18 +68,23 @@ impl<'a> Lifter<'a> {
         let mut lifter = Lifter {
             chunk,
             cfg,
-            dom,
+            _dom: dom,
             loops,
             liveness,
             regs: vec![None; max_stack.max(256)],
             pending_tables: HashMap::new(),
+            capture_aliases: HashMap::new(),
+            accumulator_regs: HashSet::new(),
             visited_blocks: HashSet::new(),
             local_names: HashMap::new(),
             declared_locals: HashSet::new(),
             num_params: chunk.num_params as u32,
             has_debug_info,
+            resolved_upvalues,
             loop_exits,
         };
+
+        lifter.accumulator_regs = lifter.find_accumulator_regs();
 
         let params: Vec<String> = (0..chunk.num_params as u32)
             .map(|i| {
@@ -142,6 +160,12 @@ impl<'a> Lifter<'a> {
                 let target = block.successors[0];
                 if self.loop_exits.contains(&target) {
                     stmts.push(Stat::Break);
+                }
+                // Follow unconditional JMP: skip ahead to target block
+                // (blocks between here and target are only reachable via the target)
+                if target > block_idx + 1 {
+                    block_idx = target;
+                    continue;
                 }
             }
 
@@ -226,16 +250,24 @@ impl<'a> Lifter<'a> {
     fn lift_generic_for(&mut self, lp: &NaturalLoop, stmts: &mut Block) -> usize {
         let header = &self.cfg.blocks[lp.header].clone();
 
-        // Find TFORLOOP instruction in the latch block
-        let latch_block = &self.cfg.blocks[lp.latch].clone();
+        // Find TFORLOOP instruction in the header or latch block
         let mut tforloop_inst = None;
-        for pc in latch_block.start..=latch_block.end {
+        for pc in header.start..=header.end {
             if self.cfg.instructions[pc].op == OpCode::TForLoop {
                 tforloop_inst = Some(self.cfg.instructions[pc]);
                 break;
             }
         }
-        let tfl = tforloop_inst.unwrap_or(self.cfg.instructions[latch_block.end]);
+        if tforloop_inst.is_none() {
+            let latch_block = &self.cfg.blocks[lp.latch].clone();
+            for pc in latch_block.start..=latch_block.end {
+                if self.cfg.instructions[pc].op == OpCode::TForLoop {
+                    tforloop_inst = Some(self.cfg.instructions[pc]);
+                    break;
+                }
+            }
+        }
+        let tfl = tforloop_inst.unwrap_or(self.cfg.instructions[header.end]);
 
         let base = tfl.a;
         let num_vars = tfl.c();
@@ -243,12 +275,28 @@ impl<'a> Lifter<'a> {
         let names: Vec<String> = (0..num_vars)
             .map(|i| self.local_name(base + 3 + i, header.start))
             .collect();
+
+        // Register loop variable names so the body can reference them
+        for (i, name) in names.iter().enumerate() {
+            let r = base + 3 + i as u32;
+            self.local_names.insert(r, name.clone());
+            self.declared_locals.insert(r);
+            self.set_reg(r, Expr::Name(name.clone()));
+        }
+
         let iter_expr = self.reg_expr(base);
 
-        let body_start = lp.header;
-        let body_end = lp.latch;
-        let body = if body_start < body_end {
-            self.lift_block_range(body_start, body_end)
+        // Body: loop blocks excluding the header, sorted by block ID
+        let mut body_blocks: Vec<usize> = lp.body.iter()
+            .filter(|&&b| b != lp.header)
+            .copied()
+            .collect();
+        body_blocks.sort();
+
+        let body = if !body_blocks.is_empty() {
+            let first = *body_blocks.first().unwrap();
+            let last = *body_blocks.last().unwrap();
+            self.lift_block_range(first, last + 1)
         } else {
             Vec::new()
         };
@@ -280,6 +328,11 @@ impl<'a> Lifter<'a> {
 
     /// Lift an if/elseif/else chain.
     fn lift_conditional(&mut self, block_idx: usize, stmts: &mut Block) -> usize {
+        // Try to detect and lift OR/AND short-circuit chains first
+        if let Some(next) = self.try_lift_or_and_chain(block_idx, stmts) {
+            return next;
+        }
+
         let block = self.cfg.blocks[block_idx].clone();
 
         // Lift any instructions before the test/JMP at the end of this block.
@@ -311,7 +364,10 @@ impl<'a> Lifter<'a> {
         // In Lua bytecode this is: TEST/EQ -> JMP past return -> RETURN -> continuation
         // The true_target block (condition true = skip JMP) is a small block ending in RETURN
         // and false_target is the continuation.
-        if self.is_return_block(true_target) && false_target > true_target {
+        // Only match if the return block is NOT a merge point (has only 1 predecessor).
+        if self.is_return_block(true_target) && false_target > true_target
+            && self.cfg.blocks[true_target].predecessors.len() <= 1
+        {
             // Guard clause: the "true" path is just a return
             let guard_body = self.lift_block_range(true_target, true_target + 1);
             stmts.push(Stat::If {
@@ -325,7 +381,10 @@ impl<'a> Lifter<'a> {
 
         // Detect inverted guard: `if cond then <continue> else return end`
         // Here false_target is a return block and true_target is the continuation
-        if self.is_return_block(false_target) && true_target < false_target {
+        // Only match if the return block is NOT a merge point.
+        if self.is_return_block(false_target) && true_target < false_target
+            && self.cfg.blocks[false_target].predecessors.len() <= 1
+        {
             let guard_body = self.lift_block_range(false_target, false_target + 1);
             let inv_cond = negate_expr(cond);
             stmts.push(Stat::If {
@@ -364,6 +423,276 @@ impl<'a> Lifter<'a> {
         merge.unwrap_or(false_target.max(true_target) + 1)
     }
 
+    /// Detect and lift OR/AND short-circuit conditional chains.
+    ///
+    /// OR pattern (`if a or b then T end`):
+    ///   Block A: ConditionalFalse → T, ConditionalTrue → Block B
+    ///   Block B: ConditionalTrue → T, ConditionalFalse → continuation
+    ///   (Intermediate blocks: ConditionalFalse → T, ConditionalTrue → next)
+    ///
+    /// AND pattern (`if a and b then body end`):
+    ///   Block A: ConditionalFalse → END, ConditionalTrue → Block B
+    ///   Block B: ConditionalFalse → END, ConditionalTrue → body
+    fn try_lift_or_and_chain(&mut self, start: usize, stmts: &mut Block) -> Option<usize> {
+        let block = &self.cfg.blocks[start];
+        if block.successors.len() != 2 { return None; }
+        if self.block_contains_testset(start) {
+            return None;
+        }
+
+        let _false0 = block.successors[0]; // ConditionalFalse (JMP target)
+        let true0 = block.successors[1];  // ConditionalTrue (fallthrough)
+
+        // true0 must be a conditional block (next test in chain)
+        if true0 >= self.cfg.num_blocks() { return None; }
+        if !self.is_conditional_block(&self.cfg.blocks[true0]) { return None; }
+        if self.block_contains_testset(true0) {
+            return None;
+        }
+
+        // Try OR chain detection
+        if let Some(result) = self.try_or_chain(start, stmts) {
+            return Some(result);
+        }
+
+        // Try AND chain detection
+        if let Some(result) = self.try_and_chain(start, stmts) {
+            return Some(result);
+        }
+
+        None
+    }
+
+    /// Detect and lift an OR chain: `if A or B or ... then T`.
+    ///
+    /// Pattern: intermediate blocks have ConditionalFalse → T (common body),
+    /// last block has ConditionalTrue → T.
+    fn try_or_chain(&mut self, start: usize, stmts: &mut Block) -> Option<usize> {
+        let block = &self.cfg.blocks[start];
+        let false0 = block.successors[0]; // ConditionalFalse = JMP target = T (body)
+        let true0 = block.successors[1];  // ConditionalTrue = next test
+
+        let body_target = false0;
+        let mut chain = vec![start]; // blocks in the chain
+        let mut current = true0;
+
+        // Follow the chain
+        loop {
+            if current >= self.cfg.num_blocks() { return None; }
+            if !self.is_conditional_block(&self.cfg.blocks[current]) { return None; }
+            if self.block_contains_testset(current) { return None; }
+
+            let cur_block = &self.cfg.blocks[current];
+            let cur_false = cur_block.successors[0]; // ConditionalFalse
+            let cur_true = cur_block.successors[1];  // ConditionalTrue
+
+            if cur_false == body_target {
+                // Intermediate block: false → T, true → next
+                chain.push(current);
+                current = cur_true;
+            } else if cur_true == body_target {
+                // Last block: true → T, false → continuation
+                chain.push(current);
+                let continuation = cur_false;
+
+                // Build the combined OR condition
+                return Some(self.emit_or_chain(&chain, body_target, continuation, stmts));
+            } else {
+                // Doesn't match the OR pattern
+                return None;
+            }
+        }
+    }
+
+    /// Emit an OR chain as a single `if` statement.
+    fn emit_or_chain(
+        &mut self,
+        chain: &[usize],
+        body_target: usize,
+        continuation: usize,
+        stmts: &mut Block,
+    ) -> usize {
+        let mut parts = Vec::new();
+
+        for (i, &block_idx) in chain.iter().enumerate() {
+            let block = self.cfg.blocks[block_idx].clone();
+            let test_pc = self.find_test_pc(&block);
+
+            // Lift pre-test instructions (updates register state)
+            if let Some(tp) = test_pc {
+                if tp > block.start {
+                    self.lift_instructions(block.start, tp - 1, stmts);
+                }
+            }
+
+            let cond = self.extract_condition(block_idx).unwrap_or(Expr::Bool(true));
+            self.visited_blocks.insert(block_idx);
+
+            let is_last = i == chain.len() - 1;
+            if is_last {
+                // Last block: ConditionalTrue → body, condition as-is
+                parts.push(cond);
+            } else {
+                // Intermediate block: ConditionalFalse → body, negate condition
+                parts.push(negate_expr(cond));
+            }
+        }
+
+        // Combine with OR
+        let combined = parts.into_iter().reduce(|a, b| {
+            Expr::BinOp(BinOp::Or, Box::new(a), Box::new(b))
+        }).unwrap_or(Expr::Bool(true));
+
+        // Lift the body (target T)
+        // Check if body is a guard clause (return)
+        if self.is_return_block(body_target) {
+            let then_block = self.lift_block_range(body_target, body_target + 1);
+            stmts.push(Stat::If {
+                cond: combined,
+                then_block,
+                elseif_clauses: Vec::new(),
+                else_block: None,
+            });
+            return continuation;
+        }
+
+        // Normal if: body with potential else
+        let merge = if self.block_flows_to(body_target, continuation) {
+            Some(continuation)
+        } else {
+            self.find_merge_point(
+                *chain.first().unwrap(),
+                body_target,
+                continuation,
+            )
+        };
+        let then_end = merge.unwrap_or(continuation);
+        let then_block = self.lift_block_range(body_target, then_end);
+
+        let else_block = if let Some(m) = merge {
+            if continuation < m {
+                let eb = self.lift_block_range(continuation, m);
+                if eb.is_empty() { None } else { Some(eb) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        stmts.push(Stat::If {
+            cond: combined,
+            then_block,
+            elseif_clauses: Vec::new(),
+            else_block,
+        });
+
+        merge.unwrap_or(continuation.max(body_target) + 1)
+    }
+
+    /// Detect and lift an AND chain: `if A and B and ... then body end`.
+    ///
+    /// Pattern: all blocks have ConditionalFalse → END (common else/end target),
+    /// ConditionalTrue chains to next test, last true → body.
+    fn try_and_chain(&mut self, start: usize, stmts: &mut Block) -> Option<usize> {
+        let block = &self.cfg.blocks[start];
+        let false0 = block.successors[0]; // ConditionalFalse = JMP target = END
+        let true0 = block.successors[1];  // ConditionalTrue = next test
+
+        let end_target = false0;
+        let mut chain = vec![start];
+        let mut current = true0;
+
+        // Follow the chain
+        loop {
+            if current >= self.cfg.num_blocks() {
+                // Reached the end of blocks; body is current
+                break;
+            }
+            if !self.is_conditional_block(&self.cfg.blocks[current]) {
+                // Non-conditional block = body
+                break;
+            }
+            if self.block_contains_testset(current) {
+                return None;
+            }
+
+            let cur_block = &self.cfg.blocks[current];
+            let cur_false = cur_block.successors[0];
+            let cur_true = cur_block.successors[1];
+
+            if cur_false == end_target {
+                // Another AND block: false → END, true → next
+                chain.push(current);
+                current = cur_true;
+            } else {
+                // Doesn't match AND pattern
+                return None;
+            }
+        }
+
+        // Need at least 2 blocks for a chain
+        if chain.len() < 2 { return None; }
+
+        let body_target = current;
+
+        // Build and emit the AND chain
+        let mut parts = Vec::new();
+
+        for &block_idx in &chain {
+            let block = self.cfg.blocks[block_idx].clone();
+            let test_pc = self.find_test_pc(&block);
+
+            if let Some(tp) = test_pc {
+                if tp > block.start {
+                    self.lift_instructions(block.start, tp - 1, stmts);
+                }
+            }
+
+            let cond = self.extract_condition(block_idx).unwrap_or(Expr::Bool(true));
+            self.visited_blocks.insert(block_idx);
+            parts.push(cond);
+        }
+
+        // Combine with AND
+        let combined = parts.into_iter().reduce(|a, b| {
+            Expr::BinOp(BinOp::And, Box::new(a), Box::new(b))
+        }).unwrap_or(Expr::Bool(true));
+
+        // Lift body and else
+        let merge = if self.block_flows_to(body_target, end_target) {
+            Some(end_target)
+        } else {
+            self.find_merge_point(
+                *chain.first().unwrap(),
+                body_target,
+                end_target,
+            )
+        };
+        let then_end = merge.unwrap_or(end_target);
+        let then_block = self.lift_block_range(body_target, then_end);
+
+        let else_block = if let Some(m) = merge {
+            if end_target < m {
+                let eb = self.lift_block_range(end_target, m);
+                if eb.is_empty() { None } else { Some(eb) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        stmts.push(Stat::If {
+            cond: combined,
+            then_block,
+            elseif_clauses: Vec::new(),
+            else_block,
+        });
+
+        Some(merge.unwrap_or(end_target.max(body_target) + 1))
+    }
+
     /// Lift a range of instructions into statements.
     fn lift_instructions(&mut self, start_pc: usize, end_pc: usize, stmts: &mut Block) {
         let mut pc = start_pc;
@@ -372,36 +701,36 @@ impl<'a> Lifter<'a> {
             match inst.op {
                 OpCode::Move => {
                     let src = self.reg_expr(inst.b());
-                    self.set_reg(inst.a, src);
+                    self.assign_reg_expr(pc, inst.a, src, stmts);
                 }
                 OpCode::LoadK => {
                     let expr = self.const_expr(inst.bx());
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::LoadBool => {
-                    self.set_reg(inst.a, Expr::Bool(inst.b() != 0));
+                    self.assign_reg_expr(pc, inst.a, Expr::Bool(inst.b() != 0), stmts);
                     if inst.c() != 0 {
                         pc += 1; // skip next instruction
                     }
                 }
                 OpCode::LoadNil => {
                     for r in inst.a..=inst.b() {
-                        self.set_reg(r, Expr::Nil);
+                        self.assign_reg_expr(pc, r, Expr::Nil, stmts);
                     }
                 }
                 OpCode::GetUpval => {
                     let expr = self.upvalue_expr(inst.b());
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::GetGlobal => {
                     let name = self.const_string(inst.bx());
-                    self.set_reg(inst.a, Expr::Global(name));
+                    self.assign_reg_expr(pc, inst.a, Expr::Global(name), stmts);
                 }
                 OpCode::GetTable => {
                     let table = self.reg_expr(inst.b());
                     let key = self.rk_expr(inst.c());
                     let expr = make_index(table, key);
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::SetGlobal => {
                     self.flush_pending_table(inst.a);
@@ -411,6 +740,8 @@ impl<'a> Lifter<'a> {
                         targets: vec![Expr::Global(name)],
                         values: vec![val],
                     });
+                    self.capture_aliases
+                        .insert(inst.a, Expr::Global(self.const_string(inst.bx())));
                 }
                 OpCode::SetUpval => {
                     let val = self.reg_expr(inst.a);
@@ -451,20 +782,23 @@ impl<'a> Lifter<'a> {
                     let val = self.rk_expr(inst.c());
                     let target = make_index(table, key);
                     stmts.push(Stat::Assign {
-                        targets: vec![target],
+                        targets: vec![target.clone()],
                         values: vec![val],
                     });
+                    if !is_k(inst.c()) {
+                        self.capture_aliases.insert(inst.c(), target);
+                    }
                 }
                 OpCode::NewTable => {
-                    self.set_reg(inst.a, Expr::Table(Vec::new()));
+                    self.assign_reg_expr(pc, inst.a, Expr::Table(Vec::new()), stmts);
                     self.pending_tables.insert(inst.a, Vec::new());
                 }
                 OpCode::Self_ => {
                     let table = self.reg_expr(inst.b());
                     let method = self.rk_expr(inst.c());
                     let method_ref = make_index(table.clone(), method);
-                    self.set_reg(inst.a + 1, table);
-                    self.set_reg(inst.a, method_ref);
+                    self.assign_reg_expr(pc, inst.a + 1, table, stmts);
+                    self.assign_reg_expr(pc, inst.a, method_ref, stmts);
                 }
                 OpCode::Add => {
                     let expr = Expr::BinOp(
@@ -472,7 +806,7 @@ impl<'a> Lifter<'a> {
                         Box::new(self.rk_expr(inst.b())),
                         Box::new(self.rk_expr(inst.c())),
                     );
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Sub => {
                     let expr = Expr::BinOp(
@@ -480,7 +814,7 @@ impl<'a> Lifter<'a> {
                         Box::new(self.rk_expr(inst.b())),
                         Box::new(self.rk_expr(inst.c())),
                     );
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Mul => {
                     let expr = Expr::BinOp(
@@ -488,7 +822,7 @@ impl<'a> Lifter<'a> {
                         Box::new(self.rk_expr(inst.b())),
                         Box::new(self.rk_expr(inst.c())),
                     );
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Div => {
                     let expr = Expr::BinOp(
@@ -496,7 +830,7 @@ impl<'a> Lifter<'a> {
                         Box::new(self.rk_expr(inst.b())),
                         Box::new(self.rk_expr(inst.c())),
                     );
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Mod => {
                     let expr = Expr::BinOp(
@@ -504,7 +838,7 @@ impl<'a> Lifter<'a> {
                         Box::new(self.rk_expr(inst.b())),
                         Box::new(self.rk_expr(inst.c())),
                     );
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Pow => {
                     let expr = Expr::BinOp(
@@ -512,19 +846,19 @@ impl<'a> Lifter<'a> {
                         Box::new(self.rk_expr(inst.b())),
                         Box::new(self.rk_expr(inst.c())),
                     );
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Unm => {
                     let expr = Expr::UnOp(UnOp::Neg, Box::new(self.reg_expr(inst.b())));
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Not => {
                     let expr = Expr::UnOp(UnOp::Not, Box::new(self.reg_expr(inst.b())));
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Len => {
                     let expr = Expr::UnOp(UnOp::Len, Box::new(self.reg_expr(inst.b())));
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Concat => {
                     let b = inst.b();
@@ -537,7 +871,7 @@ impl<'a> Lifter<'a> {
                             Box::new(self.reg_expr(r)),
                         );
                     }
-                    self.set_reg(inst.a, expr);
+                    self.assign_reg_expr(pc, inst.a, expr, stmts);
                 }
                 OpCode::Jmp => {
                     // Jumps are handled by the CFG; skip here
@@ -673,10 +1007,12 @@ impl<'a> Lifter<'a> {
                     // Internal VM operation, no visible effect in source
                 }
                 OpCode::Closure => {
+                    let closure_pc = pc;
                     let proto_idx = inst.bx() as usize;
                     let sub_func = if proto_idx < self.chunk.prototypes.len() {
                         let sub_chunk = &self.chunk.prototypes[proto_idx];
-                        Lifter::decompile(sub_chunk)
+                        let resolved = self.resolve_closure_upvalues(pc, sub_chunk, stmts);
+                        Lifter::decompile_with_upvalues(sub_chunk, resolved)
                     } else {
                         Function {
                             params: Vec::new(),
@@ -684,10 +1020,18 @@ impl<'a> Lifter<'a> {
                             body: Vec::new(),
                         }
                     };
-                    self.set_reg(inst.a, Expr::FunctionDef(Box::new(sub_func)));
+                    if proto_idx < self.chunk.prototypes.len() {
+                        pc += self.chunk.prototypes[proto_idx].num_upvalues as usize;
+                    }
+                    self.assign_reg_expr(
+                        closure_pc,
+                        inst.a,
+                        Expr::FunctionDef(Box::new(sub_func)),
+                        stmts,
+                    );
                 }
                 OpCode::VarArg => {
-                    self.set_reg(inst.a, Expr::VarArg);
+                    self.assign_reg_expr(pc, inst.a, Expr::VarArg, stmts);
                 }
             }
             pc += 1;
@@ -704,6 +1048,11 @@ impl<'a> Lifter<'a> {
         // Clear local name mapping so reg_expr returns the actual expression
         // instead of the old local name. The local is now dead (overwritten).
         self.local_names.remove(&reg);
+        // Clear any pending table — the register is being overwritten with
+        // a completely new value, so any table construction for this register
+        // is finished (or abandoned).
+        self.pending_tables.remove(&reg);
+        self.capture_aliases.remove(&reg);
     }
 
     /// Set a register and potentially emit a `local` declaration if this is a
@@ -712,7 +1061,7 @@ impl<'a> Lifter<'a> {
         if reg >= self.num_params && !self.declared_locals.contains(&reg) {
             // First assignment to this register -> declare local
             self.declared_locals.insert(reg);
-            let name = self.make_local_name(reg);
+            let name = self.make_local_name_for_expr(reg, &expr);
             self.local_names.insert(reg, name.clone());
             let r = reg as usize;
             if r < self.regs.len() {
@@ -741,10 +1090,102 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    fn assign_reg_expr(&mut self, pc: usize, reg: u32, expr: Expr, stmts: &mut Block) {
+        let block_id = self.cfg.block_of(pc);
+        let live_out_of_block = (reg as usize) < self.liveness.max_reg
+            && self.liveness.live_out[block_id][reg as usize];
+
+        if self.accumulator_regs.contains(&reg)
+            && reg >= self.num_params
+            && live_out_of_block
+        {
+            self.set_reg_local(reg, expr, stmts);
+        } else {
+            self.set_reg(reg, expr);
+        }
+    }
+
+    fn resolve_closure_upvalues(
+        &mut self,
+        pc: usize,
+        sub_chunk: &LuaChunk,
+        stmts: &mut Block,
+    ) -> Vec<Option<Expr>> {
+        let num_upvalues = sub_chunk.num_upvalues as usize;
+        let mut resolved = Vec::with_capacity(num_upvalues);
+
+        for offset in 0..num_upvalues {
+            let capture_pc = pc + 1 + offset;
+            if capture_pc >= self.cfg.instructions.len() {
+                resolved.push(None);
+                continue;
+            }
+
+            let capture = self.cfg.instructions[capture_pc];
+            let expr = match capture.op {
+                OpCode::Move => Some(self.capture_stack_upvalue(capture.b(), capture_pc, stmts)),
+                OpCode::GetUpval => Some(self.upvalue_expr(capture.b())),
+                _ => None,
+            };
+            resolved.push(expr);
+        }
+
+        resolved
+    }
+
+    fn capture_stack_upvalue(&mut self, reg: u32, pc: usize, stmts: &mut Block) -> Expr {
+        if let Some(name) = self.local_names.get(&reg).cloned() {
+            return Expr::Name(name);
+        }
+
+        if reg < self.num_params {
+            let name = self.local_name(reg, pc);
+            self.local_names.insert(reg, name.clone());
+            let r = reg as usize;
+            if r < self.regs.len() {
+                self.regs[r] = Some(Expr::Name(name.clone()));
+            }
+            return Expr::Name(name);
+        }
+
+        if let Some(alias) = self.capture_aliases.get(&reg).cloned() {
+            return alias;
+        }
+
+        match self.reg_expr(reg) {
+            Expr::Name(name) => Expr::Name(name),
+            Expr::Global(name) => Expr::Global(name),
+            Expr::Upvalue(idx) => self.upvalue_expr(idx),
+            Expr::Field(table, field) => Expr::Field(table, field),
+            expr => {
+                let name = self.local_name(reg, pc);
+                self.local_names.insert(reg, name.clone());
+                self.declared_locals.insert(reg);
+                let r = reg as usize;
+                if r < self.regs.len() {
+                    self.regs[r] = Some(Expr::Name(name.clone()));
+                }
+                self.pending_tables.remove(&reg);
+                self.capture_aliases.remove(&reg);
+                stmts.push(Stat::LocalAssign {
+                    names: vec![name.clone()],
+                    exprs: vec![expr],
+                });
+                Expr::Name(name)
+            }
+        }
+    }
+
     fn reg_expr(&self, reg: u32) -> Expr {
         // If this register has a local name, return the name reference
         if let Some(name) = self.local_names.get(&reg) {
             return Expr::Name(name.clone());
+        }
+        // If this register has a pending table with accumulated fields, return them
+        if let Some(fields) = self.pending_tables.get(&reg) {
+            if !fields.is_empty() {
+                return Expr::Table(fields.clone());
+            }
         }
         let r = reg as usize;
         if r < self.regs.len() {
@@ -791,6 +1232,11 @@ impl<'a> Lifter<'a> {
 
     fn upvalue_expr(&self, idx: u32) -> Expr {
         let i = idx as usize;
+        if i < self.resolved_upvalues.len() {
+            if let Some(expr) = &self.resolved_upvalues[i] {
+                return expr.clone();
+            }
+        }
         if i < self.chunk.upvalue_names.len() {
             let name = String::from_utf8_lossy(&self.chunk.upvalue_names[i]).into_owned();
             if !name.is_empty() {
@@ -832,33 +1278,183 @@ impl<'a> Lifter<'a> {
     }
 
     fn make_local_name(&self, reg: u32) -> String {
+        let current_expr = self.regs.get(reg as usize).and_then(|e| e.as_ref());
+        self.make_local_name_from_known_expr(reg, current_expr)
+    }
+
+    fn make_local_name_for_expr(&self, reg: u32, expr: &Expr) -> String {
+        self.make_local_name_from_known_expr(reg, Some(expr))
+    }
+
+    fn make_local_name_from_known_expr(&self, reg: u32, current_expr: Option<&Expr>) -> String {
         if reg < self.num_params {
             if self.has_debug_info {
                 return self.local_name(reg, 0);
             }
             return format!("a{}", reg);
         }
+        if let Some(name) = self.infer_accumulator_name(reg, current_expr) {
+            return self.uniquify_local_name(name);
+        }
+        if let Some(fields) = self.pending_tables.get(&reg) {
+            if !fields.is_empty() {
+                if let Some(name) = self.infer_table_local_name(fields) {
+                    return self.uniquify_local_name(name);
+                }
+            }
+        }
         // For stripped bytecode, try to infer a meaningful name from context.
         // Look at what was last stored in this register.
-        if let Some(expr) = self.regs.get(reg as usize).and_then(|e| e.as_ref()) {
+        if let Some(expr) = current_expr {
             match expr {
+                Expr::Table(fields) => {
+                    if let Some(name) = self.infer_table_local_name(fields) {
+                        return self.uniquify_local_name(name);
+                    }
+                }
                 // If it's a global function call, name after the function
                 Expr::FuncCall(call) => {
+                    if let Some(name) = self.infer_call_local_name(call) {
+                        return self.uniquify_local_name(name);
+                    }
                     if let Expr::Global(name) = &call.func {
-                        let short = name.to_ascii_lowercase();
+                        let short = normalize_call_name(name);
                         if short.len() <= 20 {
-                            return short;
+                            return self.uniquify_local_name(short);
                         }
                     }
                     // Method call: use method name
                     if let Expr::Field(_, method) = &call.func {
-                        return method.to_ascii_lowercase();
+                        return self.uniquify_local_name(normalize_call_name(method));
                     }
                 }
                 _ => {}
             }
         }
         format!("l_{}", reg)
+    }
+
+    fn infer_accumulator_name(&self, reg: u32, expr: Option<&Expr>) -> Option<String> {
+        if !self.accumulator_regs.contains(&reg) || !self.is_returned_reg(reg) {
+            return None;
+        }
+
+        match expr {
+            Some(Expr::Number(_)) | None => Some("result".to_string()),
+            _ => None,
+        }
+    }
+
+    fn infer_call_local_name(&self, call: &CallExpr) -> Option<String> {
+        let method = match &call.func {
+            Expr::Field(_, method) => method.as_str(),
+            Expr::Global(name) => name.as_str(),
+            _ => return None,
+        };
+
+        let first_int_arg = match call.args.first() {
+            Some(Expr::Number(NumLit::Int(value))) => Some(*value),
+            Some(Expr::Number(NumLit::Float(value))) if value.fract() == 0.0 => Some(*value as i64),
+            _ => None,
+        };
+
+        match method {
+            "IsHaveBuff" => Some(match first_int_arg {
+                Some(id) => format!("has_buff_{}", id),
+                None => "has_buff".to_string(),
+            }),
+            "GetBuff" | "GetBuffByOwner" => Some(match first_int_arg {
+                Some(id) => format!("buff_{}", id),
+                None => "buff".to_string(),
+            }),
+            "GetSkillLevel" => first_int_arg.map(|id| format!("skill_{}", id)),
+            "GetEndTime" => Some("end_time".to_string()),
+            "GetLogicFrameCount" => Some("logic_frame_count".to_string()),
+            _ => None,
+        }
+    }
+
+    fn is_returned_reg(&self, reg: u32) -> bool {
+        self.cfg.instructions.iter().any(|inst| {
+            inst.op == OpCode::Return && inst.a == reg && inst.b() == 2
+        })
+    }
+
+    fn uniquify_local_name(&self, base: String) -> String {
+        if !self.local_names.values().any(|name| name == &base) {
+            return base;
+        }
+
+        let mut suffix = 1;
+        loop {
+            let candidate = format!("{}_{}", base, suffix);
+            if !self.local_names.values().any(|name| name == &candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn infer_table_local_name(&self, fields: &[TableField]) -> Option<String> {
+        if fields.is_empty() {
+            return None;
+        }
+
+        if fields.iter().all(|field| matches!(field, TableField::IndexField(_, Expr::Bool(true)))) {
+            if fields.iter().any(|field| {
+                matches!(field, TableField::IndexField(key, _) if self.expr_mentions_field(key, "ENUM"))
+            }) {
+                return Some("enum_lookup".to_string());
+            }
+            return Some("lookup".to_string());
+        }
+
+        if fields.iter().all(|field| matches!(field, TableField::NameField(_, Expr::Number(_)))) {
+            let keys: Vec<&str> = fields
+                .iter()
+                .filter_map(|field| match field {
+                    TableField::NameField(name, _) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if keys.iter().any(|name| name.contains("NOT_")) {
+                return Some("penalties".to_string());
+            }
+            if keys.iter().all(|name| is_upper_ident(name)) {
+                return Some("modifiers".to_string());
+            }
+        }
+
+        None
+    }
+
+    fn expr_mentions_field(&self, expr: &Expr, field_name: &str) -> bool {
+        match expr {
+            Expr::Field(table, field) => field == field_name || self.expr_mentions_field(table, field_name),
+            Expr::Index(table, key) => {
+                self.expr_mentions_field(table, field_name)
+                    || self.expr_mentions_field(key, field_name)
+            }
+            Expr::MethodCall(call) | Expr::FuncCall(call) => {
+                self.expr_mentions_field(&call.func, field_name)
+                    || call.args.iter().any(|arg| self.expr_mentions_field(arg, field_name))
+            }
+            Expr::BinOp(_, lhs, rhs) => {
+                self.expr_mentions_field(lhs, field_name)
+                    || self.expr_mentions_field(rhs, field_name)
+            }
+            Expr::UnOp(_, inner) => self.expr_mentions_field(inner, field_name),
+            Expr::Table(fields) => fields.iter().any(|field| match field {
+                TableField::IndexField(key, value) => {
+                    self.expr_mentions_field(key, field_name)
+                        || self.expr_mentions_field(value, field_name)
+                }
+                TableField::NameField(_, value) | TableField::Value(value) => {
+                    self.expr_mentions_field(value, field_name)
+                }
+            }),
+            _ => false,
+        }
     }
 
     /// Flush the pending table construction for a specific register.
@@ -932,6 +1528,45 @@ impl<'a> Lifter<'a> {
             })
     }
 
+    fn block_contains_testset(&self, block_idx: usize) -> bool {
+        if block_idx >= self.cfg.num_blocks() {
+            return false;
+        }
+        let block = &self.cfg.blocks[block_idx];
+        (block.start..=block.end).any(|pc| self.cfg.instructions[pc].op == OpCode::TestSet)
+    }
+
+    fn block_flows_to(&self, from_block: usize, target_block: usize) -> bool {
+        if from_block >= self.cfg.num_blocks() || target_block >= self.cfg.num_blocks() {
+            return false;
+        }
+        self.cfg.blocks[from_block].successors.iter().all(|&succ| succ == target_block)
+    }
+
+    fn find_accumulator_regs(&self) -> HashSet<u32> {
+        let mut regs = HashSet::new();
+
+        for inst in &self.cfg.instructions {
+            match inst.op {
+                OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow => {
+                    let uses_target = (!is_k(inst.b()) && inst.a == inst.b())
+                        || (!is_k(inst.c()) && inst.a == inst.c());
+                    if uses_target {
+                        regs.insert(inst.a);
+                    }
+                }
+                OpCode::Concat => {
+                    if inst.a >= inst.b() && inst.a <= inst.c() {
+                        regs.insert(inst.a);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        regs
+    }
+
     fn extract_condition(&self, block_idx: usize) -> Option<Expr> {
         let block = &self.cfg.blocks[block_idx];
         // Look for the test instruction (second-to-last, before JMP)
@@ -989,32 +1624,44 @@ impl<'a> Lifter<'a> {
 
     fn find_merge_point(
         &self,
-        _cond_block: usize,
+        cond_block: usize,
         true_block: usize,
         false_block: usize,
     ) -> Option<usize> {
+        if false_block < self.cfg.num_blocks() {
+            let false_preds = &self.cfg.blocks[false_block].predecessors;
+            if false_preds.len() >= 3
+                && false_preds.contains(&cond_block)
+                && false_preds
+                    .iter()
+                    .any(|&pred| pred != cond_block && pred >= true_block && pred < false_block)
+            {
+                return Some(false_block);
+            }
+        }
+
         // Simple heuristic: the merge point is the smallest block ID
         // that is a successor of both branches (or the false_block if
         // the true block falls through to it).
         let max_branch = true_block.max(false_block);
 
-        // Look for a block after both branches where control re-merges
+        // Look for a block after both branches where control re-merges.
         for b in (max_branch + 1)..self.cfg.num_blocks() {
             let block = &self.cfg.blocks[b];
             if block.predecessors.len() >= 2 {
                 return Some(b);
             }
-            // If this block has no predecessors from within the if branches,
-            // it's likely the merge.
-            if !block.predecessors.iter().all(|&p| {
-                p >= true_block && p <= max_branch
-            }) && block.predecessors.iter().any(|&p| p >= true_block) {
+            if !block
+                .predecessors
+                .iter()
+                .all(|&p| p >= true_block && p <= max_branch)
+                && block.predecessors.iter().any(|&p| p >= true_block)
+            {
                 return Some(b);
             }
         }
 
-        // Fallback: if false_block > true_block, false might be the merge
-        if false_block > true_block {
+        if false_block > true_block && false_block > cond_block {
             return Some(false_block);
         }
 
@@ -1047,6 +1694,37 @@ fn is_identifier(s: &str) -> bool {
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !is_lua_keyword(s)
+}
+
+fn is_upper_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s
+            .chars()
+            .all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+fn normalize_call_name(name: &str) -> String {
+    let snake = camel_to_snake(name);
+    snake
+        .strip_prefix("get_")
+        .or_else(|| snake.strip_prefix("is_"))
+        .map(ToOwned::to_owned)
+        .unwrap_or(snake)
+}
+
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if idx != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn is_lua_keyword(s: &str) -> bool {

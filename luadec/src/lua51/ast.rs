@@ -1,7 +1,7 @@
 /// Lua AST node types for decompiled output.
 
 /// A complete Lua function body (chunk).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub params: Vec<String>,
     pub is_vararg: bool,
@@ -12,7 +12,7 @@ pub struct Function {
 pub type Block = Vec<Stat>;
 
 /// Lua statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stat {
     /// `local var1, var2 = expr1, expr2`
     LocalAssign {
@@ -68,7 +68,7 @@ pub enum Stat {
 }
 
 /// Lua expression.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// `nil`
     Nil,
@@ -107,21 +107,21 @@ pub enum Expr {
 }
 
 /// Numeric literal (preserves integer vs float distinction).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NumLit {
     Int(i64),
     Float(f64),
 }
 
 /// Function/method call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CallExpr {
     pub func: Expr,
     pub args: Vec<Expr>,
 }
 
 /// Table constructor field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TableField {
     /// `[expr] = expr`
     IndexField(Expr, Expr),
