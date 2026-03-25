@@ -1,6 +1,6 @@
 [package]
 name = "luadec-rust"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 description = "A Lua 5.1 bytecode decompiler written in Rust"
 license = "MIT"
