@@ -36,8 +36,10 @@ pub struct Lifter<'a> {
     has_debug_info: bool,
     /// Upvalue expressions resolved from the parent closure site.
     resolved_upvalues: Vec<Option<Expr>>,
-    /// Loop exit block IDs for break detection.
-    loop_exits: HashSet<usize>,
+    /// Active loop headers being lifted to avoid re-entering the same loop.
+    active_loop_headers: Vec<usize>,
+    /// Exit blocks for active loops, innermost last.
+    active_loop_exits: Vec<usize>,
 }
 
 impl<'a> Lifter<'a> {
@@ -54,15 +56,6 @@ impl<'a> Lifter<'a> {
         let loops = find_loops(&cfg, &dom);
         let liveness = compute_liveness(&cfg, chunk.max_stack as usize);
         let has_debug_info = !chunk.locals.is_empty();
-
-        // Collect loop exit blocks for break detection
-        let mut loop_exits = HashSet::new();
-        for lp in &loops {
-            let max_body = lp.body.iter().copied().max().unwrap_or(lp.header);
-            if max_body + 1 < cfg.num_blocks() {
-                loop_exits.insert(max_body + 1);
-            }
-        }
 
         let max_stack = chunk.max_stack as usize;
         let mut lifter = Lifter {
@@ -81,7 +74,8 @@ impl<'a> Lifter<'a> {
             num_params: chunk.num_params as u32,
             has_debug_info,
             resolved_upvalues,
-            loop_exits,
+            active_loop_headers: Vec::new(),
+            active_loop_exits: Vec::new(),
         };
 
         lifter.accumulator_regs = lifter.find_accumulator_regs();
@@ -117,7 +111,7 @@ impl<'a> Lifter<'a> {
 
         while block_idx < end_block && block_idx < self.cfg.num_blocks() {
             // Prevent revisiting blocks
-            if !self.visited_blocks.insert(block_idx) {
+            if self.visited_blocks.contains(&block_idx) {
                 block_idx += 1;
                 continue;
             }
@@ -134,6 +128,8 @@ impl<'a> Lifter<'a> {
                 }
                 continue;
             }
+
+            self.visited_blocks.insert(block_idx);
 
             let block = self.cfg.blocks[block_idx].clone();
             let _last_pc = block.end;
@@ -158,7 +154,7 @@ impl<'a> Lifter<'a> {
             let last_inst = self.cfg.instructions[block.end];
             if last_inst.op == OpCode::Jmp && block.successors.len() == 1 {
                 let target = block.successors[0];
-                if self.loop_exits.contains(&target) {
+                if self.current_loop_exit() == Some(target) {
                     stmts.push(Stat::Break);
                 }
                 // Follow unconditional JMP: skip ahead to target block
@@ -186,6 +182,7 @@ impl<'a> Lifter<'a> {
 
     fn lift_numeric_for(&mut self, lp: &NaturalLoop, stmts: &mut Block) -> usize {
         let header = &self.cfg.blocks[lp.header].clone();
+        let loop_exit = self.max_loop_block(lp) + 1;
 
         // Find the FORPREP instruction: it's in the block preceding the header
         // or in the header itself.  The FORPREP's A register tells us the for-loop slots.
@@ -202,10 +199,13 @@ impl<'a> Lifter<'a> {
 
         // Lift the pre-loop setup to get init/limit/step
         if let Some(fb) = forprep_block {
-            let b = &self.cfg.blocks[fb].clone();
-            // Lift instructions before FORPREP to set up init/limit/step
-            if b.end > b.start {
-                self.lift_instructions(b.start, b.end - 1, stmts);
+            if !self.visited_blocks.contains(&fb) {
+                let b = &self.cfg.blocks[fb].clone();
+                self.visited_blocks.insert(fb);
+                // Lift instructions before FORPREP to set up init/limit/step
+                if b.end > b.start {
+                    self.lift_instructions(b.start, b.end - 1, stmts);
+                }
             }
         }
 
@@ -218,22 +218,11 @@ impl<'a> Lifter<'a> {
             Some(step_expr)
         };
 
-        // Body: blocks between header and latch (exclusive of FORLOOP block)
-        let body_start = lp.header + 1;
-        let body_end = lp.latch;
-        let body = if body_start < body_end {
-            self.lift_block_range(body_start, body_end)
-        } else {
-            // Single-block body: the header IS the body (header contains FORLOOP at end)
-            let hdr = self.cfg.blocks[lp.header].clone();
-            if hdr.end > hdr.start {
-                let mut body = Vec::new();
-                self.lift_instructions(hdr.start, hdr.end - 1, &mut body);
-                body
-            } else {
-                Vec::new()
-            }
-        };
+        self.active_loop_headers.push(lp.header);
+        self.active_loop_exits.push(loop_exit);
+        let body = self.lift_block_range(lp.header, lp.latch + 1);
+        self.active_loop_exits.pop();
+        self.active_loop_headers.pop();
 
         stmts.push(Stat::NumericFor {
             name: var_name,
@@ -244,7 +233,7 @@ impl<'a> Lifter<'a> {
         });
 
         // Return the block after the loop exit
-        self.max_loop_block(lp) + 1
+        loop_exit
     }
 
     fn lift_generic_for(&mut self, lp: &NaturalLoop, stmts: &mut Block) -> usize {
@@ -293,6 +282,8 @@ impl<'a> Lifter<'a> {
             .collect();
         body_blocks.sort();
 
+        self.active_loop_headers.push(lp.header);
+        self.active_loop_exits.push(self.max_loop_block(lp) + 1);
         let body = if !body_blocks.is_empty() {
             let first = *body_blocks.first().unwrap();
             let last = *body_blocks.last().unwrap();
@@ -300,6 +291,8 @@ impl<'a> Lifter<'a> {
         } else {
             Vec::new()
         };
+        self.active_loop_exits.pop();
+        self.active_loop_headers.pop();
 
         stmts.push(Stat::GenericFor {
             names,
@@ -317,9 +310,13 @@ impl<'a> Lifter<'a> {
         let cond = self.extract_condition(lp.header).unwrap_or(Expr::Bool(true));
 
         // Body: blocks in the loop excluding header
+        self.active_loop_headers.push(lp.header);
+        self.active_loop_exits.push(self.max_loop_block(lp) + 1);
         let body_start = lp.header + 1;
         let body_end = lp.latch + 1;
         let body = self.lift_block_range(body_start, body_end);
+        self.active_loop_exits.pop();
+        self.active_loop_headers.pop();
 
         stmts.push(Stat::While { cond, body });
 
@@ -1490,7 +1487,14 @@ impl<'a> Lifter<'a> {
     }
 
     fn find_loop_at(&self, block_idx: usize) -> Option<&NaturalLoop> {
+        if self.active_loop_headers.contains(&block_idx) {
+            return None;
+        }
         self.loops.iter().find(|l| l.header == block_idx)
+    }
+
+    fn current_loop_exit(&self) -> Option<usize> {
+        self.active_loop_exits.last().copied()
     }
 
     fn find_forprep_block(&self, header: usize) -> Option<usize> {

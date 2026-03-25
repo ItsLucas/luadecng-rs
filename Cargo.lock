@@ -103,12 +103,13 @@ dependencies = [
 name = "luadec-cli"
 version = "1.0.1"
 dependencies = [
+ "luac-parser",
  "luadec-rust",
 ]
 
 [[package]]
 name = "luadec-rust"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "encoding_rs",
  "luac-parser",

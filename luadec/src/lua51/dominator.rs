@@ -1,4 +1,5 @@
 use crate::lua51::cfg::{ControlFlowGraph, EdgeKind};
+use crate::lua51::opcodes::OpCode;
 
 /// Dominator tree for a control flow graph.
 ///
@@ -186,14 +187,32 @@ pub fn find_loops(cfg: &ControlFlowGraph, dom: &DominatorTree) -> Vec<NaturalLoo
     let mut loops = Vec::new();
 
     for edge in &cfg.edges {
-        // A back-edge: edge.to dominates edge.from
-        if dom.dominates(edge.to, edge.from) {
+        let target_block = &cfg.blocks[edge.to];
+        let target_ends_with_forloop = matches!(
+            cfg.instructions[target_block.end].op,
+            OpCode::ForLoop | OpCode::TForLoop
+        );
+
+        // Numeric/generic for loops have explicit back-edge kinds and do not
+        // satisfy the normal dominance check because FORPREP jumps directly to
+        // the FORLOOP block before entering the body.
+        let is_explicit_loop_back = matches!(edge.kind, EdgeKind::ForLoopBack | EdgeKind::TForLoopBack);
+        let is_natural_back_edge = dom.dominates(edge.to, edge.from)
+            && !(target_ends_with_forloop && !is_explicit_loop_back);
+
+        if is_explicit_loop_back || is_natural_back_edge {
             let header = edge.to;
             let latch = edge.from;
 
             // Collect loop body: all blocks that can reach `latch` without
             // going through `header`.
-            let body = collect_loop_body(cfg, header, latch);
+            let mut body = collect_loop_body(cfg, header, latch);
+            if edge.kind == EdgeKind::ForLoopBack {
+                body.retain(|&block_id| {
+                    let block = &cfg.blocks[block_id];
+                    cfg.instructions[block.end].op != OpCode::ForPrep
+                });
+            }
 
             // Classify the loop kind based on the edge type and instructions.
             let kind = classify_loop(cfg, edge.kind, header);
